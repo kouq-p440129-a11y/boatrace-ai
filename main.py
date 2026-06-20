@@ -1,0 +1,1 @@
+print("boatrace-ai")
