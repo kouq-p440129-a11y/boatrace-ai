@@ -20,4 +20,4 @@ jobs:
 
       - name: Run main
         run: |
-          printf "6\nmikuni\n1\ny\n" | python main.py
+          printf "6\n三国\n\n1\n45\n" | python main.py
