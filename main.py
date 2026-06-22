@@ -1769,10 +1769,10 @@ def get_recent_completed_race_urls(place_code, base_date_str, limit=20, max_days
         for rno in range(12, 0, -1):
             if len(urls) >= limit:
                 return urls
-            url = f"{BASE_URL}/race/{place_code}/{date_str}/{rno}R/race-detail"
-                        if not place_code:
+                            if not place_code:
                 print(f"⚠️ 場コードなしのためスキップ: {date_str} {rno}R")
                 continue
+            url = f"{BASE_URL}/race/{place_code}/{date_str}/{rno}R/race-detail"
             label = f"{PLACE_MAP_REV.get(place_code, place_code)} {date_str} {rno}R"
             print("  [探索]", label)
             try:
