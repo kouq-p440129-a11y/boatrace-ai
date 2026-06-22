@@ -20,4 +20,4 @@ jobs:
 
       - name: Run main
         run: |
-          printf "6\n\n\n100\n300\ny\n\n" | python main.py
+          printf "6\n\n\n1\n300\ny\ny\n" | python main.py
