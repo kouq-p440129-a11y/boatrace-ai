@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-ボートレース予想・検証ツール v24.3 debug HTML保存強化版
+ボートレース予想・検証ツール v25.1 prediction_history分析版
 - Pyto/iPhone想定
 - 取得が止まる場所を特定するため、GET開始/完了/BS開始/完了を表示
 - 全requestsにtimeoutを設定
@@ -1083,6 +1083,360 @@ def official_result_url_from_race_url(race_url):
     return f"https://www.boatrace.jp/owpc/pc/race/raceresult?rno={rno}&jcd={jcd}&hd={hd}"
 
 
+
+
+def parse_boaters_result_texts(texts):
+    """
+    v24.5: BOATERS /race-result の縦並びテキストを直接解析する。
+    例:
+      3連単 / 1 / 2 / 5 / 1,480 / 円 / 2
+      スタート情報 ... 決まり手 ... 逃げ
+      水面気象情報 ... 風速 / 5 / m/s ... 波高 / 5 / cm
+    """
+    result = {
+        "着順": "",
+        "3連単": "",
+        "3連単払戻": "",
+        "人気": "",
+        "決まり手": "",
+        "風速": "",
+        "風向": "",
+        "波高": "",
+        "水温": "",
+        "着順リスト": "",
+        "結果3連単": "",
+    }
+
+    if not texts:
+        return result
+
+    texts = [unicodedata.normalize("NFKC", str(t)).strip() for t in texts if str(t).strip()]
+    texts = [t.replace("三連単", "3連単") for t in texts]
+
+    # 3連単・払戻・人気
+    try:
+        idx = texts.index("3連単")
+        combo = str(texts[idx + 1]) + "-" + str(texts[idx + 2]) + "-" + str(texts[idx + 3])
+        payout = safe_int(texts[idx + 4])
+        popularity = str(texts[idx + 6]) if idx + 6 < len(texts) else ""
+        if is_valid_trifecta(combo) and payout > 0:
+            result["3連単"] = combo
+            result["着順"] = combo
+            result["結果3連単"] = combo
+            result["3連単払戻"] = str(payout) + "円"
+            result["人気"] = popularity
+    except Exception:
+        pass
+
+    # 着順リスト。レース結果ブロックの「着」「枠」以降から、着順→枠番のペアを拾う。
+    try:
+        idx = texts.index("レース結果")
+        order = []
+        expected = "1"
+        i = idx + 1
+        while i < len(texts) and len(order) < 6:
+            if texts[i] in ["スタート情報", "着順の記号について"]:
+                break
+            if texts[i] == expected and i + 1 < len(texts) and texts[i + 1] in ["1", "2", "3", "4", "5", "6"]:
+                order.append(texts[i + 1])
+                expected = str(len(order) + 1)
+                i += 2
+                continue
+            i += 1
+        if order:
+            result["着順リスト"] = "-".join(order)
+            if len(order) >= 3:
+                result["結果3連単"] = "-".join(order[:3])
+                if not result["3連単"]:
+                    result["3連単"] = result["結果3連単"]
+                    result["着順"] = result["結果3連単"]
+    except Exception:
+        pass
+
+    # 決まり手。スタート情報ブロック優先。
+    kimarite_list = ["逃げ", "差し", "まくり", "まくり差し", "抜き", "恵まれ"]
+    try:
+        idx = texts.index("スタート情報")
+        around = texts[idx:idx + 60]
+    except Exception:
+        around = texts
+    for t in around:
+        if t in kimarite_list:
+            result["決まり手"] = t
+            break
+    if not result["決まり手"]:
+        for t in texts:
+            if t in kimarite_list:
+                result["決まり手"] = t
+                break
+
+    # 水面気象情報
+    for i, t in enumerate(texts):
+        try:
+            if t == "風速":
+                result["風速"] = texts[i + 1] + texts[i + 2]
+            elif t == "風向":
+                result["風向"] = texts[i + 1]
+            elif t == "波高":
+                result["波高"] = texts[i + 1] + texts[i + 2]
+            elif t == "水温":
+                result["水温"] = texts[i + 1] + texts[i + 2]
+        except Exception:
+            pass
+
+    return result
+
+
+def append_prediction_history(record):
+    """v24.5: 予想と結果を prediction_history.json に蓄積する。"""
+    hist_file = save_path("prediction_history.json")
+    try:
+        if os.path.exists(hist_file) and os.path.getsize(hist_file) > 0:
+            with open(hist_file, "r", encoding="utf-8") as f:
+                history = json.load(f)
+            if not isinstance(history, list):
+                history = []
+        else:
+            history = []
+    except Exception:
+        history = []
+
+    history.append(record)
+    with open(hist_file, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+    return hist_file
+
+
+# ===== v25.1: prediction_history分析・共有結果出力 =====
+def ensure_dir(path):
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass
+    return path
+
+
+def results_path(filename):
+    d = ensure_dir(save_path("results"))
+    return os.path.join(d, filename)
+
+
+def logs_path(filename):
+    d = ensure_dir(save_path("logs"))
+    return os.path.join(d, filename)
+
+
+def write_latest_log(message):
+    """ChatGPTに渡しやすい最新ログを保存する。"""
+    p = logs_path("latest.log")
+    try:
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(datetime.now().isoformat(timespec="seconds") + " " + str(message) + "\n")
+    except Exception:
+        pass
+    return p
+
+
+def parse_yen_or_number(value):
+    """'1,230円' '5m' '3cm' などから整数部分を抜く。"""
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    s = str(value)
+    m = re.search(r"-?\d+", s.replace(",", ""))
+    return int(m.group(0)) if m else 0
+
+
+def normalize_hit(value):
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    return s in ("1", "true", "yes", "y", "的中")
+
+
+def history_bet_amount(record):
+    """prediction_historyの1レコードから投資額を推定する。基本は100円/点。"""
+    if "投資額" in record:
+        return parse_yen_or_number(record.get("投資額"))
+    bets = record.get("予想買い目", [])
+    if isinstance(bets, str):
+        # "1-2-3 1-3-2" のような文字列にも対応
+        bet_count = len([x for x in re.split(r"[\s,、]+", bets.strip()) if x])
+    elif isinstance(bets, list):
+        bet_count = len(bets)
+    else:
+        bet_count = 0
+    # Xなどで買わない運用だった場合に備える
+    if record.get("安定度ランク") == "X" and record.get("回収", 0) in (0, "0", ""):
+        # ただし履歴だけではskip_x判定が完全には分からないため、買い目があるなら投資した扱いにする
+        pass
+    return bet_count * 100
+
+
+def metric_template():
+    return {"件数": 0, "購入対象": 0, "投資": 0, "払戻": 0, "的中": 0}
+
+
+def add_metric(bucket, record):
+    bet = history_bet_amount(record)
+    pay = parse_yen_or_number(record.get("回収", 0))
+    hit = normalize_hit(record.get("的中", False))
+    bucket["件数"] += 1
+    if bet > 0:
+        bucket["購入対象"] += 1
+    bucket["投資"] += bet
+    bucket["払戻"] += pay
+    bucket["的中"] += 1 if hit else 0
+
+
+def finalize_metric(bucket):
+    races = bucket.get("件数", 0)
+    bought = bucket.get("購入対象", 0)
+    bet = bucket.get("投資", 0)
+    pay = bucket.get("払戻", 0)
+    hit = bucket.get("的中", 0)
+    bucket["的中率"] = round(hit / races * 100, 1) if races else 0
+    bucket["購入時的中率"] = round(hit / bought * 100, 1) if bought else 0
+    bucket["回収率"] = round(pay / bet * 100, 1) if bet else 0
+    return bucket
+
+
+def wind_bucket(value):
+    n = parse_yen_or_number(value)
+    if n <= 2:
+        return "0-2m"
+    if n <= 5:
+        return "3-5m"
+    return "6m以上"
+
+
+def wave_bucket(value):
+    n = parse_yen_or_number(value)
+    if n <= 2:
+        return "0-2cm"
+    if n <= 5:
+        return "3-5cm"
+    return "6cm以上"
+
+
+def confidence_bucket_from_score(value):
+    n = parse_yen_or_number(value)
+    if n >= 80:
+        return "80以上"
+    if n >= 70:
+        return "70-79"
+    if n >= 60:
+        return "60-69"
+    if n >= 50:
+        return "50-59"
+    if n > 0:
+        return "49以下"
+    return "不明"
+
+
+def build_prediction_history_summary(history):
+    """v25.1: prediction_history.jsonから自己学習用の集計を作る。"""
+    total = metric_template()
+    groups = {
+        "信頼度ランク別": {},
+        "1号艇信頼度帯別": {},
+        "場別": {},
+        "風速帯別": {},
+        "波高帯別": {},
+        "決まり手別": {},
+        "人気別": {},
+    }
+
+    for rec in history:
+        if not isinstance(rec, dict):
+            continue
+        add_metric(total, rec)
+
+        keys = {
+            "信頼度ランク別": rec.get("安定度ランク") or "不明",
+            "1号艇信頼度帯別": rec.get("1号艇信頼度帯") or confidence_bucket_from_score(rec.get("1号艇信頼度")),
+            "場別": rec.get("場コード") or "不明",
+            "風速帯別": wind_bucket(rec.get("風速") or rec.get("結果風速")),
+            "波高帯別": wave_bucket(rec.get("波高") or rec.get("結果波高")),
+            "決まり手別": rec.get("決まり手") or "不明",
+            "人気別": str(rec.get("人気") or "不明"),
+        }
+        for gname, key in keys.items():
+            if key not in groups[gname]:
+                groups[gname][key] = metric_template()
+            add_metric(groups[gname][key], rec)
+
+    summary = {
+        "version": "v25.1",
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "source": "prediction_history.json",
+        "保存先": SAVE_DIR,
+        "全体": finalize_metric(total),
+        "分析": {},
+        "次アクション": [],
+    }
+
+    for gname, data in groups.items():
+        finalized = {k: finalize_metric(v) for k, v in data.items()}
+        # 件数が多い順で並べる
+        summary["分析"][gname] = dict(sorted(finalized.items(), key=lambda kv: kv[1].get("件数", 0), reverse=True))
+
+    # 簡易提案: 件数10以上かつ回収率が高い条件を抽出
+    candidates = []
+    for gname, data in summary["分析"].items():
+        for key, v in data.items():
+            if v.get("件数", 0) >= 10 and v.get("回収率", 0) >= 110:
+                candidates.append({"条件": gname, "値": key, "件数": v["件数"], "的中率": v["的中率"], "回収率": v["回収率"]})
+    candidates.sort(key=lambda x: (x["回収率"], x["件数"]), reverse=True)
+    summary["高回収候補"] = candidates[:20]
+
+    if not history:
+        summary["次アクション"].append("prediction_history.jsonが空です。まずモード5/6で20件以上バックテストしてください。")
+    elif summary["全体"].get("件数", 0) < 100:
+        summary["次アクション"].append("まだ件数が少ないです。最低100件、理想400件まで増やしてから補正を強めます。")
+    else:
+        summary["次アクション"].append("信頼度ランク別・場別・風速帯別の回収率を見て、v25.2以降で買い目点数を調整します。")
+    return summary
+
+
+def load_prediction_history():
+    p = save_path("prediction_history.json")
+    if not os.path.exists(p):
+        return []
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        write_latest_log("prediction_history読込失敗: " + type(e).__name__ + " " + str(e))
+        return []
+
+
+def save_prediction_history_summary():
+    """results/backtest_summary.json と prediction_history_summary.json の両方に保存。"""
+    history = load_prediction_history()
+    summary = build_prediction_history_summary(history)
+    p1 = results_path("backtest_summary.json")
+    p2 = save_path("prediction_history_summary.json")
+    for p in (p1, p2):
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+    write_latest_log("prediction_history分析保存: " + p1)
+    return summary, p1, p2
+
+
+def run_history_analysis():
+    summary, p1, p2 = save_prediction_history_summary()
+    print("\n===== v25.1 prediction_history分析 =====")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    print("✅ results保存:", p1)
+    print("✅ 互換保存:", p2)
+    print("✅ ログ:", logs_path("latest.log"))
+
+
 def extract_result_info(race_url, debug=False):
     """
     v20: 結果取得を24場向けに強化。
@@ -1128,7 +1482,22 @@ def extract_result_info(race_url, debug=False):
                 print("[結果候補]", label, u, "len=", len(text), "sig=", html_sig(text))
                 print(text[:800])
 
-            result = parse_result_text(text)
+            texts = []
+            for t in text.split("\n"):
+                t = t.strip()
+                if t:
+                    texts.append(t)
+
+            # v24.5: BOATERS /race-result は縦並びテキストを直接解析する。
+            if "boaters" in label or "related" in label or "detail" in label:
+                result = parse_boaters_result_texts(texts)
+                fallback = parse_result_text(text)
+                for k, v in fallback.items():
+                    if not result.get(k) and v:
+                        result[k] = v
+            else:
+                result = parse_result_text(text)
+
             result["結果URL"] = u
             result["結果取得エラー"] = ""
 
@@ -1245,7 +1614,7 @@ def parse_result_text(text):
     - トップ/一覧ページ由来の誤抽出を防止
     - 公式/BOATERSの縦並びに対応
     """
-    result = {"着順": "", "3連単": "", "3連単払戻": "", "決まり手": ""}
+    result = {"着順": "", "3連単": "", "3連単払戻": "", "人気": "", "決まり手": "", "風速": "", "風向": "", "波高": "", "水温": "", "着順リスト": "", "結果3連単": ""}
     joined = normalize_result_text(text)
     lines = [x.strip() for x in joined.split("\n") if x.strip()]
 
@@ -1574,7 +1943,8 @@ def get_csv_fieldnames():
         "1号艇進入安定度", "1号艇逃げ率",
         "v22特徴取得数", "v22本文キーワード", "v22特徴監査", "v241取得元監査",
         "予想買い目", "投資額", "結果", "1着艇", "2着艇", "3着艇",
-        "払戻", "的中", "回収", "決まり手",
+        "払戻", "人気", "的中", "回収", "決まり手", "結果URL", "結果3連単", "着順リスト",
+        "結果風速", "結果風向", "結果波高", "結果水温",
         "選手プロファイル素材", "結果取得エラー", "エラー"
     ]
 
@@ -1668,6 +2038,9 @@ def build_summary(rows):
     summary["レース番号カテゴリ別"] = group_summary("レース番号カテゴリ")
     summary["節日別"] = group_summary("節日")
     summary["決まり手別"] = group_summary("決まり手")
+    summary["結果風速別"] = group_summary("結果風速")
+    summary["結果波高別"] = group_summary("結果波高")
+    summary["人気別"] = group_summary("人気")
     summary["レース分類別"] = group_summary("レース分類")
     summary["1号艇展示順位別"] = group_summary("1号艇展示順位")
     summary["1号艇オッズ妙味別"] = group_summary("1号艇オッズ妙味")
@@ -1678,6 +2051,23 @@ def save_summary_json(json_file, rows):
     summary = build_summary(rows)
     with open(json_file, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    # v25.1: ChatGPTと共有しやすい固定パスにも保存する。
+    try:
+        ensure_dir(save_path("results"))
+        shared_file = results_path("backtest_summary.json")
+        with open(shared_file, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        write_latest_log("backtest_summary保存: " + shared_file)
+    except Exception as e:
+        print("  ⚠️ results/backtest_summary.json保存失敗:", type(e).__name__, str(e))
+
+    # v25.1: prediction_history.jsonがあれば履歴分析サマリも更新する。
+    try:
+        if os.path.exists(save_path("prediction_history.json")):
+            save_prediction_history_summary()
+    except Exception as e:
+        print("  ⚠️ prediction_history分析保存失敗:", type(e).__name__, str(e))
     return summary
 
 def backtest_urls(urls, skip_x=True, include_deep=False, filename_prefix="backtest"):
@@ -1765,19 +2155,58 @@ def backtest_urls(urls, skip_x=True, include_deep=False, filename_prefix="backte
                     "2着艇": second,
                     "3着艇": third,
                     "払戻": payout,
+                    "人気": result.get("人気", ""),
                     "的中": "1" if hit else "0",
                     "回収": pay,
                     "決まり手": result.get("決まり手", ""),
+                    "結果URL": result.get("結果URL", ""),
+                    "結果3連単": result.get("結果3連単", trifecta),
+                    "着順リスト": result.get("着順リスト", ""),
+                    "結果風速": result.get("風速", ""),
+                    "結果風向": result.get("風向", ""),
+                    "結果波高": result.get("波高", ""),
+                    "結果水温": result.get("水温", ""),
                     "選手プロファイル素材": json.dumps(race_data.get("選手プロファイル素材", []), ensure_ascii=False),
                     "結果取得エラー": result.get("結果取得エラー", ""),
                     "エラー": "",
                 })
-                print("  rank=", rank, "inner=", row["1号艇信頼度"], "result=", trifecta, "hit=", hit, "pay=", pay)
+
+                # v24.5: 予想と結果を蓄積。あとで自己学習・条件別分析に使う。
+                try:
+                    history_record = {
+                        "保存日時": datetime.now().isoformat(timespec="seconds"),
+                        "レース": title,
+                        "URL": url,
+                        "場コード": row.get("場コード", ""),
+                        "日付": row.get("日付", ""),
+                        "レース番号": row.get("レース番号", ""),
+                        "安定度ランク": rank,
+                        "1号艇信頼度": inner_score,
+                        "1号艇信頼度帯": row.get("1号艇信頼度帯", ""),
+                        "予想買い目": bets,
+                        "結果": trifecta,
+                        "払戻": payout,
+                        "人気": result.get("人気", ""),
+                        "的中": bool(hit),
+                        "回収": pay,
+                        "決まり手": result.get("決まり手", ""),
+                        "風速": result.get("風速", ""),
+                        "風向": result.get("風向", ""),
+                        "波高": result.get("波高", ""),
+                        "水温": result.get("水温", ""),
+                        "結果URL": result.get("結果URL", ""),
+                    }
+                    append_prediction_history(history_record)
+                except Exception as hist_e:
+                    print("  ⚠️ prediction_history保存失敗:", type(hist_e).__name__, str(hist_e))
+
+                print("  rank=", rank, "inner=", row["1号艇信頼度"], "result=", trifecta, "hit=", hit, "pay=", pay, "kimarite=", result.get("決まり手", ""), "wind=", result.get("風速", ""), "wave=", result.get("波高", ""))
             except Exception as e:
                 row.update({
                     "解析選手数": "", "安定度ランク": "?", "安定度スコア": "", "1号艇信頼度": "",
-                    "予想買い目": "", "投資額": 0, "結果": "", "払戻": 0,
-                    "的中": "0", "回収": 0, "決まり手": "", "結果取得エラー": "",
+                    "予想買い目": "", "投資額": 0, "結果": "", "払戻": 0, "人気": "",
+                    "的中": "0", "回収": 0, "決まり手": "", "結果URL": "", "結果3連単": "", "着順リスト": "",
+                    "結果風速": "", "結果風向": "", "結果波高": "", "結果水温": "", "結果取得エラー": "",
                     "エラー": type(e).__name__ + ": " + str(e),
                 })
                 print("  エラー:", row["エラー"])
@@ -2070,13 +2499,14 @@ def run_url_test():
 
 
 def main():
-    print("\n===== ボートレース予想・検証ツール v24.3 debug HTML保存強化版 =====")
+    print("\n===== ボートレース予想・検証ツール v25.1 prediction_history分析版 =====")
     print("保存先:", SAVE_DIR)
     print("1: 締切前レース予想")
     print("2: URL直接指定で予想/取得テスト")
     print("5: 三国の直近Nレースをバックテスト（20件から推奨）")
     print("6: 任意場の直近Nレースをバックテスト（20件から推奨）")
     print("7: HTMLキーワード監査（v24 URL役割別 /data等を確認）")
+    print("8: prediction_history分析（v25.1 / results出力）")
 
     mode = input("\nモードを選んでください: ").strip()
 
@@ -2121,6 +2551,8 @@ def main():
             run_recent_backtest_multi(place_codes)
     elif mode == "7":
         run_keyword_audit()
+    elif mode == "8":
+        run_history_analysis()
     else:
         print("未対応モードです")
 
