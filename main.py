@@ -1739,7 +1739,20 @@ def is_valid_race_detail_html(html, place_code, date_str, rno, debug=False):
 
 def get_recent_completed_race_urls(place_code, base_date_str, limit=20, max_days=45, debug=True):
     urls = []
+
+    # v25.1修正：place_code空対策
+    place_code = (place_code or "").strip()
+
+    if not place_code:
+        print("❌ place_code が空です")
+        return []
+
+    place_code = PLACE_MAP.get(place_code, place_code)
+
+    print("DEBUG place_code =", place_code)
+
     try:
+
         base_dt = datetime.strptime(base_date_str, "%Y-%m-%d") if base_date_str else datetime.now()
     except Exception:
         base_dt = datetime.now()
