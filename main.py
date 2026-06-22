@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-ボートレース予想・検証ツール v25.1 prediction_history分析版
+ボートレース予想・検証ツール v25.2 場コード堅牢化版
 - Pyto/iPhone想定
 - 取得が止まる場所を特定するため、GET開始/完了/BS開始/完了を表示
 - 全requestsにtimeoutを設定
@@ -1370,7 +1370,7 @@ def build_prediction_history_summary(history):
             add_metric(groups[gname][key], rec)
 
     summary = {
-        "version": "v25.1",
+        "version": "v25.2",
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "source": "prediction_history.json",
         "保存先": SAVE_DIR,
@@ -1430,7 +1430,7 @@ def save_prediction_history_summary():
 
 def run_history_analysis():
     summary, p1, p2 = save_prediction_history_summary()
-    print("\n===== v25.1 prediction_history分析 =====")
+    print("\n===== v25.2 prediction_history分析 =====")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     print("✅ results保存:", p1)
     print("✅ 互換保存:", p2)
@@ -1740,19 +1740,13 @@ def is_valid_race_detail_html(html, place_code, date_str, rno, debug=False):
 def get_recent_completed_race_urls(place_code, base_date_str, limit=20, max_days=45, debug=True):
     urls = []
 
-    # v25.1修正：place_code空対策
-    place_code = (place_code or "").strip()
-
+    # v25.2: 場コードが空/未知のままURL生成される事故を防止
+    place_code = normalize_place_code(place_code)
     if not place_code:
-        print("❌ place_code が空です")
+        print("❌ place_code が空または未知です。URL探索を中止します。")
         return []
 
-    place_code = PLACE_MAP.get(place_code, place_code)
-
-    print("DEBUG place_code =", place_code)
-
     try:
-
         base_dt = datetime.strptime(base_date_str, "%Y-%m-%d") if base_date_str else datetime.now()
     except Exception:
         base_dt = datetime.now()
@@ -1769,9 +1763,12 @@ def get_recent_completed_race_urls(place_code, base_date_str, limit=20, max_days
         for rno in range(12, 0, -1):
             if len(urls) >= limit:
                 return urls
+
+            # v25.2: 念のためURL作成直前にもガード
             if not place_code:
                 print(f"⚠️ 場コードなしのためスキップ: {date_str} {rno}R")
                 continue
+
             url = f"{BASE_URL}/race/{place_code}/{date_str}/{rno}R/race-detail"
             label = f"{PLACE_MAP_REV.get(place_code, place_code)} {date_str} {rno}R"
             print("  [探索]", label)
@@ -2253,8 +2250,13 @@ def backtest_urls(urls, skip_x=True, include_deep=False, filename_prefix="backte
 
 
 def run_recent_backtest(place_code="mikuni"):
+    place_code = normalize_place_code(place_code)
+    if not place_code:
+        print("❌ 対象場が不正です。例: 三国 / mikuni / 唐津 / karatsu")
+        return [], {}
+
     print("\n===== 直近Nレース バックテスト =====")
-    print("対象場:", PLACE_MAP_REV.get(place_code, place_code))
+    print("対象場:", PLACE_MAP_REV.get(place_code, place_code), "/ code:", place_code)
     base_date = input("基準日 YYYY-MM-DD（空欄なら今日）: ").strip()
     limit_s = input("検証件数（まず20推奨 / 空欄なら100）: ").strip()
     max_days_s = input("最大探索日数（空欄なら45日）: ").strip()
@@ -2348,34 +2350,65 @@ def keyword_presence_report(url):
 
 
 
+def normalize_place_code(value):
+    """v25.2: 日本語場名/英字場コードを安全に英字コードへ正規化する。
+    空文字・未知コードは None を返し、/race//... の生成を防ぐ。
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return None
+
+    code = PLACE_MAP.get(raw, raw)
+    code = (code or "").strip()
+
+    if not code:
+        return None
+
+    if code not in PLACE_MAP_REV:
+        print("⚠️ 未知の場名/場コードのため除外:", raw, "→", code)
+        return None
+
+    return code
+
+
 def parse_place_codes_input(place_input):
-    """v24.2: メニュー6で複数場をカンマ区切り指定できるようにする。"""
+    """v25.2: メニュー6で複数場をカンマ区切り指定。空/未知コードは除外する。"""
     q = (place_input or "").strip()
     if not q:
         return []
+
     if q.lower() in ["all", "ぜんぶ", "全部", "24場"]:
-        # PLACE_MAPは「唐津」「からつ」など重複があるため、コード重複を除外。
         seen = []
         for code in PLACE_MAP.values():
-            if code not in seen:
+            code = normalize_place_code(code)
+            if code and code not in seen:
                 seen.append(code)
         return seen
+
     parts = re.split(r"[,，、\s]+", q)
     codes = []
     for part in parts:
-        part = part.strip()
-        if not part:
+        code = normalize_place_code(part)
+        if not code:
             continue
-        code = PLACE_MAP.get(part, part)
-        if code not in PLACE_MAP_REV:
-            print("⚠️ 未知の場名/場コードの可能性:", part, "→", code)
         if code not in codes:
             codes.append(code)
+
+    if not codes:
+        print("❌ 有効な場コードがありません。例: 三国 / mikuni / 唐津 / karatsu / all")
+
     return codes
 
 
 def run_recent_backtest_multi(place_codes):
-    """v24.2: 複数場を順番実行。保存は場ごと＋最後に合算JSON。"""
+    """v25.2: 複数場を順番実行。空/未知コードを除外してから実行。"""
+    normalized = []
+    for c in (place_codes or []):
+        code = normalize_place_code(c)
+        if code and code not in normalized:
+            normalized.append(code)
+    place_codes = normalized
+
     if not place_codes:
         print("対象場がありません")
         return [], {}
@@ -2515,14 +2548,14 @@ def run_url_test():
 
 
 def main():
-    print("\n===== ボートレース予想・検証ツール v25.1 prediction_history分析版 =====")
+    print("\n===== ボートレース予想・検証ツール v25.2 場コード堅牢化版 =====")
     print("保存先:", SAVE_DIR)
     print("1: 締切前レース予想")
     print("2: URL直接指定で予想/取得テスト")
     print("5: 三国の直近Nレースをバックテスト（20件から推奨）")
     print("6: 任意場の直近Nレースをバックテスト（20件から推奨）")
     print("7: HTMLキーワード監査（v24 URL役割別 /data等を確認）")
-    print("8: prediction_history分析（v25.1 / results出力）")
+    print("8: prediction_history分析（v25.2 / results出力）")
 
     mode = input("\nモードを選んでください: ").strip()
 
@@ -2561,8 +2594,11 @@ def main():
         print("選択可能:", " / ".join(PLACE_MAP.keys()))
         place_jp = input("場名を入力してください（例: 若松 / 三国,住之江,唐津,徳山 / all）: ").strip()
         place_codes = parse_place_codes_input(place_jp)
-        if len(place_codes) <= 1:
-            run_recent_backtest(place_codes[0] if place_codes else PLACE_MAP.get(place_jp, place_jp))
+        if not place_codes:
+            print("❌ 有効な場が指定されていないため中止します。")
+            return
+        if len(place_codes) == 1:
+            run_recent_backtest(place_codes[0])
         else:
             run_recent_backtest_multi(place_codes)
     elif mode == "7":
