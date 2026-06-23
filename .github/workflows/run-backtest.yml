@@ -21,3 +21,16 @@ jobs:
       - name: Run main
         run: |
           printf "6\nall\n\n20\n45\ny\nn\n" | python main.py
+
+      - name: Show Summary
+        run: |
+          echo "===== SUMMARY ====="
+          cat backtest_multi_recent_summary.json
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results
+          path: |
+            *.json
+            *.csv
