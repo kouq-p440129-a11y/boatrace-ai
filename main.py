@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-ボートレース予想・検証ツール v25.2 場コード堅牢化版
+ボートレース予想・検証ツール v25.3 条件抽出エンジン
 - Pyto/iPhone想定
 - 取得が止まる場所を特定するため、GET開始/完了/BS開始/完了を表示
 - 全requestsにtimeoutを設定
@@ -54,6 +54,35 @@ PLACE_MAP = {
 
 PLACE_MAP_REV = {v: k for k, v in PLACE_MAP.items()}
 PLACE_MAP_REV["karatsu"] = "唐津"
+
+# v25.3: 場の水質カテゴリ。条件抽出・場別補正の土台。
+# ※分類は運用上の仮分類。必要に応じて後で場ごとに補正する。
+WATER_TYPE_MAP = {
+    "kiryu": "淡水",
+    "toda": "淡水",
+    "edogawa": "汽水",
+    "heiwajima": "海水",
+    "tamagawa": "淡水",
+    "hamanako": "汽水",
+    "gamagori": "海水",
+    "tokoname": "海水",
+    "tsu": "海水",
+    "mikuni": "淡水",
+    "biwako": "淡水",
+    "suminoe": "淡水",
+    "amagasaki": "淡水",
+    "naruto": "海水",
+    "marugame": "海水",
+    "kojima": "海水",
+    "miyajima": "海水",
+    "tokuyama": "海水",
+    "shimonoseki": "海水",
+    "wakamatsu": "海水",
+    "ashiya": "淡水",
+    "fukuoka": "海水",
+    "karatsu": "淡水",
+    "omura": "海水",
+}
 
 JCD_MAP = {
     "kiryu": "01", "toda": "02", "edogawa": "03", "heiwajima": "04",
@@ -1337,17 +1366,70 @@ def confidence_bucket_from_score(value):
     return "不明"
 
 
+def water_type_for_place(place_code):
+    code = normalize_place_code(place_code) if "normalize_place_code" in globals() else (place_code or "")
+    return WATER_TYPE_MAP.get(code, "不明")
+
+
+def race_time_bucket_from_no(race_no):
+    n = parse_yen_or_number(race_no)
+    if n <= 0:
+        return "不明"
+    if n <= 4:
+        return "序盤(1-4R)"
+    if n <= 8:
+        return "中盤(5-8R)"
+    return "終盤(9-12R)"
+
+
+def roi_value(metric):
+    return float(metric.get("回収率", 0) or 0)
+
+
+def build_roi_ranking(group_data, min_count=10, limit=30):
+    items = []
+    for key, v in group_data.items():
+        if v.get("件数", 0) >= min_count:
+            items.append({
+                "値": key,
+                "件数": v.get("件数", 0),
+                "的中率": v.get("的中率", 0),
+                "回収率": v.get("回収率", 0),
+                "投資": v.get("投資", 0),
+                "払戻": v.get("払戻", 0),
+            })
+    items.sort(key=lambda x: (x.get("回収率", 0), x.get("件数", 0)), reverse=True)
+    return items[:limit]
+
+
+def add_combo_metric(groups, group_name, key, record):
+    if not key or "不明" in str(key):
+        return
+    if group_name not in groups:
+        groups[group_name] = {}
+    if key not in groups[group_name]:
+        groups[group_name][key] = metric_template()
+    add_metric(groups[group_name][key], record)
+
+
 def build_prediction_history_summary(history):
-    """v25.1: prediction_history.jsonから自己学習用の集計を作る。"""
+    """v25.3: prediction_history.jsonから条件抽出用の集計を作る。"""
     total = metric_template()
     groups = {
         "信頼度ランク別": {},
         "1号艇信頼度帯別": {},
         "場別": {},
+        "水質別": {},
+        "レース時間帯別": {},
         "風速帯別": {},
         "波高帯別": {},
         "決まり手別": {},
         "人気別": {},
+        "場×1号艇信頼度帯": {},
+        "水質×1号艇信頼度帯": {},
+        "場×レース時間帯": {},
+        "水質×レース時間帯": {},
+        "風速帯×1号艇信頼度帯": {},
     }
 
     for rec in history:
@@ -1355,52 +1437,80 @@ def build_prediction_history_summary(history):
             continue
         add_metric(total, rec)
 
+        place = rec.get("場コード") or "不明"
+        water = water_type_for_place(place)
+        confidence = rec.get("1号艇信頼度帯") or confidence_bucket_from_score(rec.get("1号艇信頼度"))
+        race_time = rec.get("レース番号カテゴリ") or race_time_bucket_from_no(rec.get("レース番号"))
+        wind = wind_bucket(rec.get("風速") or rec.get("結果風速"))
+        wave = wave_bucket(rec.get("波高") or rec.get("結果波高"))
+
         keys = {
             "信頼度ランク別": rec.get("安定度ランク") or "不明",
-            "1号艇信頼度帯別": rec.get("1号艇信頼度帯") or confidence_bucket_from_score(rec.get("1号艇信頼度")),
-            "場別": rec.get("場コード") or "不明",
-            "風速帯別": wind_bucket(rec.get("風速") or rec.get("結果風速")),
-            "波高帯別": wave_bucket(rec.get("波高") or rec.get("結果波高")),
+            "1号艇信頼度帯別": confidence,
+            "場別": place,
+            "水質別": water,
+            "レース時間帯別": race_time,
+            "風速帯別": wind,
+            "波高帯別": wave,
             "決まり手別": rec.get("決まり手") or "不明",
             "人気別": str(rec.get("人気") or "不明"),
+            "場×1号艇信頼度帯": f"{place}×{confidence}",
+            "水質×1号艇信頼度帯": f"{water}×{confidence}",
+            "場×レース時間帯": f"{place}×{race_time}",
+            "水質×レース時間帯": f"{water}×{race_time}",
+            "風速帯×1号艇信頼度帯": f"{wind}×{confidence}",
         }
         for gname, key in keys.items():
+            if not key or "不明" in str(key):
+                continue
             if key not in groups[gname]:
                 groups[gname][key] = metric_template()
             add_metric(groups[gname][key], rec)
 
     summary = {
-        "version": "v25.2",
+        "version": "v25.3",
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "source": "prediction_history.json",
         "保存先": SAVE_DIR,
         "全体": finalize_metric(total),
         "分析": {},
+        "ROIランキング": {},
+        "推奨条件": [],
         "次アクション": [],
     }
 
     for gname, data in groups.items():
         finalized = {k: finalize_metric(v) for k, v in data.items()}
-        # 件数が多い順で並べる
         summary["分析"][gname] = dict(sorted(finalized.items(), key=lambda kv: kv[1].get("件数", 0), reverse=True))
+        summary["ROIランキング"][gname] = build_roi_ranking(finalized, min_count=10, limit=20)
 
-    # 簡易提案: 件数10以上かつ回収率が高い条件を抽出
+    # v25.3: 実用候補。複合条件は偶然値を減らすため件数15以上、単独条件は件数20以上。
     candidates = []
     for gname, data in summary["分析"].items():
+        is_combo = "×" in gname
+        min_count = 15 if is_combo else 20
         for key, v in data.items():
-            if v.get("件数", 0) >= 10 and v.get("回収率", 0) >= 110:
-                candidates.append({"条件": gname, "値": key, "件数": v["件数"], "的中率": v["的中率"], "回収率": v["回収率"]})
+            if v.get("件数", 0) >= min_count and v.get("回収率", 0) >= 110:
+                candidates.append({
+                    "条件": gname,
+                    "値": key,
+                    "件数": v["件数"],
+                    "的中率": v["的中率"],
+                    "回収率": v["回収率"],
+                    "投資": v.get("投資", 0),
+                    "払戻": v.get("払戻", 0),
+                })
     candidates.sort(key=lambda x: (x["回収率"], x["件数"]), reverse=True)
-    summary["高回収候補"] = candidates[:20]
+    summary["推奨条件"] = candidates[:30]
+    summary["高回収候補"] = candidates[:30]  # 互換用
 
     if not history:
         summary["次アクション"].append("prediction_history.jsonが空です。まずモード5/6で20件以上バックテストしてください。")
     elif summary["全体"].get("件数", 0) < 100:
         summary["次アクション"].append("まだ件数が少ないです。最低100件、理想400件まで増やしてから補正を強めます。")
     else:
-        summary["次アクション"].append("信頼度ランク別・場別・風速帯別の回収率を見て、v25.2以降で買い目点数を調整します。")
+        summary["次アクション"].append("推奨条件の件数と回収率を確認し、v25.4で推奨条件のみ購入するフィルタバックテストへ進みます。")
     return summary
-
 
 def load_prediction_history():
     p = save_path("prediction_history.json")
@@ -1430,7 +1540,7 @@ def save_prediction_history_summary():
 
 def run_history_analysis():
     summary, p1, p2 = save_prediction_history_summary()
-    print("\n===== v25.2 prediction_history分析 =====")
+    print("\n===== v25.3 prediction_history分析 =====")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     print("✅ results保存:", p1)
     print("✅ 互換保存:", p2)
@@ -1740,7 +1850,7 @@ def is_valid_race_detail_html(html, place_code, date_str, rno, debug=False):
 def get_recent_completed_race_urls(place_code, base_date_str, limit=20, max_days=45, debug=True):
     urls = []
 
-    # v25.2: 場コードが空/未知のままURL生成される事故を防止
+    # v25.3: 場コードが空/未知のままURL生成される事故を防止
     place_code = normalize_place_code(place_code)
     if not place_code:
         print("❌ place_code が空または未知です。URL探索を中止します。")
@@ -1764,7 +1874,7 @@ def get_recent_completed_race_urls(place_code, base_date_str, limit=20, max_days
             if len(urls) >= limit:
                 return urls
 
-            # v25.2: 念のためURL作成直前にもガード
+            # v25.3: 念のためURL作成直前にもガード
             if not place_code:
                 print(f"⚠️ 場コードなしのためスキップ: {date_str} {rno}R")
                 continue
@@ -2011,6 +2121,7 @@ def build_summary(rows):
     hit_count = sum(safe_int(r.get("的中", 0)) for r in rows)
     roi = round(total_pay / total_bet * 100, 1) if total_bet else 0
     summary = {
+        "version": "v25.3",
         "対象レース数": len(rows),
         "購入対象レース数": sum(1 for r in rows if safe_int(r.get("投資額", 0)) > 0),
         "的中数": hit_count,
@@ -2032,10 +2143,16 @@ def build_summary(rows):
         v["回収率"] = str(round(v["払戻"] / v["投資"] * 100, 1)) + "%" if v["投資"] else "-"
     summary["ランク別"] = by_rank
 
-    def group_summary(key):
+    def group_summary(key_or_func):
         groups = {}
         for r in rows:
-            k = r.get(key, "") or "不明"
+            if callable(key_or_func):
+                k = key_or_func(r)
+            else:
+                k = r.get(key_or_func, "")
+            k = k or "不明"
+            if k == "不明":
+                continue
             if k not in groups:
                 groups[k] = {"件数": 0, "投資": 0, "払戻": 0, "的中": 0}
             groups[k]["件数"] += 1
@@ -2045,20 +2162,71 @@ def build_summary(rows):
         for k, v in groups.items():
             v["回収率"] = str(round(v["払戻"] / v["投資"] * 100, 1)) + "%" if v["投資"] else "-"
             v["的中率"] = str(round(v["的中"] / v["件数"] * 100, 1)) + "%" if v["件数"] else "-"
-        return groups
+        return dict(sorted(groups.items(), key=lambda kv: kv[1].get("件数", 0), reverse=True))
+
+    def pct_to_float(v):
+        try:
+            return float(str(v).replace("%", ""))
+        except Exception:
+            return 0.0
+
+    def ranking(data, min_count=10, limit=20):
+        arr = []
+        for k, v in data.items():
+            if v.get("件数", 0) >= min_count:
+                item = dict(v)
+                item["値"] = k
+                item["回収率数値"] = pct_to_float(v.get("回収率"))
+                arr.append(item)
+        arr.sort(key=lambda x: (x.get("回収率数値", 0), x.get("件数", 0)), reverse=True)
+        return arr[:limit]
 
     summary["1号艇信頼度帯別"] = group_summary("1号艇信頼度帯")
     summary["レース番号カテゴリ別"] = group_summary("レース番号カテゴリ")
+    summary["レース時間帯別"] = group_summary(lambda r: race_time_bucket_from_no(r.get("レース番号")))
     summary["節日別"] = group_summary("節日")
+    summary["場別"] = group_summary("場コード")
+    summary["水質別"] = group_summary(lambda r: water_type_for_place(r.get("場コード")))
     summary["決まり手別"] = group_summary("決まり手")
     summary["結果風速別"] = group_summary("結果風速")
+    summary["結果風速帯別"] = group_summary(lambda r: wind_bucket(r.get("結果風速")))
     summary["結果波高別"] = group_summary("結果波高")
+    summary["結果波高帯別"] = group_summary(lambda r: wave_bucket(r.get("結果波高")))
     summary["人気別"] = group_summary("人気")
     summary["レース分類別"] = group_summary("レース分類")
     summary["1号艇展示順位別"] = group_summary("1号艇展示順位")
     summary["1号艇オッズ妙味別"] = group_summary("1号艇オッズ妙味")
-    return summary
 
+    # v25.3: 複合条件。買わないレースを削るための候補抽出に使う。
+    summary["場×1号艇信頼度帯"] = group_summary(lambda r: f"{r.get('場コード') or '不明'}×{r.get('1号艇信頼度帯') or confidence_bucket_from_score(r.get('1号艇信頼度'))}")
+    summary["水質×1号艇信頼度帯"] = group_summary(lambda r: f"{water_type_for_place(r.get('場コード'))}×{r.get('1号艇信頼度帯') or confidence_bucket_from_score(r.get('1号艇信頼度'))}")
+    summary["場×レース時間帯"] = group_summary(lambda r: f"{r.get('場コード') or '不明'}×{race_time_bucket_from_no(r.get('レース番号'))}")
+    summary["水質×レース時間帯"] = group_summary(lambda r: f"{water_type_for_place(r.get('場コード'))}×{race_time_bucket_from_no(r.get('レース番号'))}")
+    summary["風速帯×1号艇信頼度帯"] = group_summary(lambda r: f"{wind_bucket(r.get('結果風速'))}×{r.get('1号艇信頼度帯') or confidence_bucket_from_score(r.get('1号艇信頼度'))}")
+
+    rank_targets = [
+        "場別", "水質別", "1号艇信頼度帯別", "レース時間帯別", "場×1号艇信頼度帯",
+        "水質×1号艇信頼度帯", "場×レース時間帯", "水質×レース時間帯", "風速帯×1号艇信頼度帯"
+    ]
+    summary["ROIランキング"] = {k: ranking(summary.get(k, {}), min_count=10, limit=20) for k in rank_targets}
+
+    candidates = []
+    for k in rank_targets:
+        min_count = 15 if "×" in k else 20
+        for item in ranking(summary.get(k, {}), min_count=min_count, limit=50):
+            if item.get("回収率数値", 0) >= 110:
+                candidates.append({
+                    "条件": k,
+                    "値": item.get("値"),
+                    "件数": item.get("件数"),
+                    "的中率": item.get("的中率"),
+                    "回収率": item.get("回収率"),
+                    "投資": item.get("投資"),
+                    "払戻": item.get("払戻"),
+                })
+    candidates.sort(key=lambda x: (float(str(x.get("回収率", "0")).replace("%", "")), x.get("件数", 0)), reverse=True)
+    summary["推奨条件"] = candidates[:30]
+    return summary
 
 def save_summary_json(json_file, rows):
     summary = build_summary(rows)
@@ -2351,7 +2519,7 @@ def keyword_presence_report(url):
 
 
 def normalize_place_code(value):
-    """v25.2: 日本語場名/英字場コードを安全に英字コードへ正規化する。
+    """v25.3: 日本語場名/英字場コードを安全に英字コードへ正規化する。
     空文字・未知コードは None を返し、/race//... の生成を防ぐ。
     """
     raw = (value or "").strip()
@@ -2372,7 +2540,7 @@ def normalize_place_code(value):
 
 
 def parse_place_codes_input(place_input):
-    """v25.2: メニュー6で複数場をカンマ区切り指定。空/未知コードは除外する。"""
+    """v25.3: メニュー6で複数場をカンマ区切り指定。空/未知コードは除外する。"""
     q = (place_input or "").strip()
     if not q:
         return []
@@ -2401,7 +2569,7 @@ def parse_place_codes_input(place_input):
 
 
 def run_recent_backtest_multi(place_codes):
-    """v25.2: 複数場を順番実行。空/未知コードを除外してから実行。"""
+    """v25.3: 複数場を順番実行。空/未知コードを除外してから実行。"""
     normalized = []
     for c in (place_codes or []):
         code = normalize_place_code(c)
@@ -2548,14 +2716,14 @@ def run_url_test():
 
 
 def main():
-    print("\n===== ボートレース予想・検証ツール v25.2 場コード堅牢化版 =====")
+    print("\n===== ボートレース予想・検証ツール v25.3 条件抽出エンジン =====")
     print("保存先:", SAVE_DIR)
     print("1: 締切前レース予想")
     print("2: URL直接指定で予想/取得テスト")
     print("5: 三国の直近Nレースをバックテスト（20件から推奨）")
     print("6: 任意場の直近Nレースをバックテスト（20件から推奨）")
     print("7: HTMLキーワード監査（v24 URL役割別 /data等を確認）")
-    print("8: prediction_history分析（v25.2 / results出力）")
+    print("8: prediction_history分析（v25.3 / 条件抽出）")
 
     mode = input("\nモードを選んでください: ").strip()
 
