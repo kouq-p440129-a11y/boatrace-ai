@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-ボートレース予想・検証ツール v25.4 オーケストレーター版
+ボートレース予想・検証ツール v25.5 ポートフォリオ試作版
 - Pyto/iPhone想定
 - 取得が止まる場所を特定するため、GET開始/完了/BS開始/完了を表示
 - 全requestsにtimeoutを設定
 - 直近Nレース探索はrace-detail存在優先で緩く追加
 - CSV/JSON保存先は書き込み可能な場所を自動選択
 - v21: AI3連対率/AI予測1着率/展示タイム順位/展示ST順位/進入安定度/決まり手率を予想スコアへ反映
+- v25.5: Engine-Aは現行ロジック維持。Engine-B（的中率重視）とポートフォリオ提案を追加。
+- v25.5: 各艇スコア内訳・買い目採用理由ログをCSV/JSONへ保存。
 
 まずは：モード5/6 → 件数20 → 詳細y でテスト推奨。1レースごとにCSV追記保存・再開対応。
 """
@@ -2028,8 +2030,99 @@ def score_inner_confidence(race_data):
     return {"1号艇信頼度": score, "理由": reasons}
 
 
-def make_machine_bets(race_data):
-    # v21: 的中予想の前に「硬い/中間/穴狙い」を分類して買い目を分岐。
+def _add_score(parts, key, value, reason):
+    """v25.5: スコア内訳を安全に積み上げる小ヘルパー。"""
+    try:
+        v = float(value)
+    except Exception:
+        v = 0.0
+    parts[key] = round(parts.get(key, 0) + v, 2)
+    if reason and abs(v) > 0:
+        parts.setdefault("理由", []).append(f"{reason}({v:+.1f})")
+
+
+def score_racer_probability(race_data, racer):
+    """
+    v25.5 Engine-B用：艇ごとの「確率寄り」スコア。
+    目的はROIではなく、上位3艇に入りやすい艇を素直に評価すること。
+    Engine-Aの買い目ロジックは変更しない。
+    """
+    frame = safe_int(racer.get("枠")) or 0
+    parts = {"枠": frame, "選手名": racer.get("選手名", ""), "理由": []}
+
+    # 枠順の基礎点。Bはまず起こりやすさを評価する。
+    frame_base = {1: 22, 2: 15, 3: 13, 4: 10, 5: 7, 6: 4}.get(frame, 0)
+    _add_score(parts, "枠点", frame_base, "枠基礎")
+
+    cls = str(racer.get("級別", ""))
+    class_score = {"A1": 14, "A2": 8, "B1": 2, "B2": -6}.get(cls, 0)
+    _add_score(parts, "級別点", class_score, "級別" + cls if cls else "級別")
+
+    # 全国/当地成績
+    nat = safe_float(racer.get("全国3連率"))
+    if nat is not None:
+        _add_score(parts, "全国点", (nat - 45) * 0.18, "全国3連率")
+    loc = safe_float(racer.get("当地3連率"))
+    if loc is not None:
+        _add_score(parts, "当地点", (loc - 45) * 0.12, "当地3連率")
+
+    # STは小さいほど良い。
+    st = safe_float(racer.get("平均ST"))
+    if st is not None:
+        if st <= 0.13:
+            _add_score(parts, "ST点", 8, "平均ST良")
+        elif st <= 0.16:
+            _add_score(parts, "ST点", 4, "平均ST標準以上")
+        elif st >= 0.20:
+            _add_score(parts, "ST点", -7, "平均ST遅い")
+        elif st >= 0.18:
+            _add_score(parts, "ST点", -4, "平均STやや遅い")
+
+    # モーター・ボート。現状ボート2連率が取れない場合は空欄のまま無視。
+    motor = safe_float(racer.get("モーター2連率"))
+    if motor is not None:
+        _add_score(parts, "モーター点", (motor - 35) * 0.22, "モーター2連率")
+    boat = safe_float(racer.get("ボート2連率"))
+    if boat is not None:
+        _add_score(parts, "ボート点", (boat - 35) * 0.12, "ボート2連率")
+
+    # AI情報。取得できた時だけ強く使う。
+    ai3 = safe_float(racer.get("AI3連対率"))
+    if ai3 is not None:
+        _add_score(parts, "AI点", (ai3 - 50) * 0.35, "AI3連対率")
+    ai1 = safe_float(racer.get("AI予測1着率")) or safe_float(racer.get("AI1着率"))
+    if ai1 is not None:
+        _add_score(parts, "AI点", (ai1 - 15) * 0.25, "AI1着率")
+
+    # 展示。Bではかなり重視する。欠損なら無理に補完しない。
+    ex_rank = safe_int(racer.get("展示順位"))
+    if ex_rank:
+        _add_score(parts, "展示点", {1: 14, 2: 10, 3: 5, 4: 0, 5: -5, 6: -8}.get(ex_rank, 0), "展示順位")
+    ex_diff = safe_float(racer.get("展示差"))
+    if ex_diff is not None:
+        if ex_diff <= 0.02:
+            _add_score(parts, "展示点", 4, "展示差小")
+        elif ex_diff >= 0.08:
+            _add_score(parts, "展示点", -8, "展示差大")
+        elif ex_diff >= 0.05:
+            _add_score(parts, "展示点", -4, "展示差やや大")
+
+    ex_st_rank = safe_int(racer.get("展示ST順位"))
+    if ex_st_rank:
+        _add_score(parts, "展示ST点", {1: 8, 2: 5, 3: 2, 4: 0, 5: -4, 6: -6}.get(ex_st_rank, 0), "展示ST順位")
+
+    # F持ちはBでは素直に減点。
+    f = safe_int(racer.get("F持ち")) or 0
+    if f:
+        _add_score(parts, "減点", -6 * f, "F持ち")
+
+    total = sum(v for k, v in parts.items() if k not in ["枠", "選手名", "理由"] and isinstance(v, (int, float)))
+    parts["合計"] = round(total, 2)
+    return parts
+
+
+def build_engine_a_prediction(race_data):
+    """v25.5: 既存ロジックをEngine-Aとして固定。期待値/展開変化検出モデル。"""
     stability = score_race_stability(race_data)
     inner = score_inner_confidence(race_data)
     inner_score = inner["1号艇信頼度"]
@@ -2038,22 +2131,149 @@ def make_machine_bets(race_data):
 
     if style == "硬め本線":
         bets = ["1-3-4", "1-4-3", "1-3-2", "1-2-3", "1-4-2", "1-2-4"]
+        reason = "Engine-A: 硬め本線。ただし既存Aの並びは維持。"
     elif style == "穴狙い":
         bets = ["3-1-2", "3-2-1", "4-1-3", "4-3-1", "1-3-2", "1-4-3", "5-3-1", "3-5-1"]
+        reason = "Engine-A: 逃げ崩れ・展開変化狙い。"
     else:
         if inner_score >= 70:
             bets = ["1-2-3", "1-3-2", "1-3-4", "1-4-3", "1-2-4", "1-4-2"]
+            reason = "Engine-A: 中間だが1号艇信頼高め。"
         elif inner_score >= 55:
             bets = ["1-3-2", "3-1-2", "1-2-3", "3-2-1", "1-3-4", "3-1-4", "4-1-3", "1-4-3"]
+            reason = "Engine-A: 中間。1軸と3攻めを併用。"
         else:
             bets = ["3-1-2", "3-2-1", "4-1-3", "4-3-1", "1-3-2", "1-4-3", "5-3-1", "3-5-1"]
+            reason = "Engine-A: 1号艇信頼低め。展開変化を優先。"
 
     return {
+        "エンジン": "A",
+        "思想": "期待値・展開変化検出",
         "安定度": stability,
         "イン信頼": inner,
         "レース分類": race_style,
         "買い目": bets,
         "点数": len(bets),
+        "採用理由": reason,
+    }
+
+
+def build_engine_b_prediction(race_data):
+    """v25.5: 新規Engine-B。的中率重視・確率最大化モデル。"""
+    racers = race_data.get("出走表", []) or []
+    scores = [score_racer_probability(race_data, r) for r in racers]
+    scores = sorted(scores, key=lambda x: x.get("合計", 0), reverse=True)
+    top = [str(x.get("枠")) for x in scores if x.get("枠")][:4]
+
+    # 1号艇信頼が高い場合は1着固定を厚く。低い場合でもBは「最も起こりやすい順」を優先する。
+    inner = score_inner_confidence(race_data)
+    inner_score = inner.get("1号艇信頼度", 0)
+    first_candidates = []
+    if inner_score >= 65 and "1" in top:
+        first_candidates = ["1"]
+    else:
+        first_candidates = top[:2]
+        if "1" not in first_candidates and inner_score >= 55:
+            first_candidates.append("1")
+
+    bets = []
+    for first in first_candidates:
+        others = [x for x in top if x != first]
+        for second in others[:3]:
+            for third in others[:3]:
+                if third == second:
+                    continue
+                combo = f"{first}-{second}-{third}"
+                if combo not in bets:
+                    bets.append(combo)
+                if len(bets) >= 8:
+                    break
+            if len(bets) >= 8:
+                break
+        if len(bets) >= 8:
+            break
+
+    if not bets and len(top) >= 3:
+        bets = [f"{top[0]}-{top[1]}-{top[2]}"]
+
+    return {
+        "エンジン": "B",
+        "思想": "的中率・確率最大化",
+        "艇スコア": scores,
+        "上位艇": top,
+        "イン信頼": inner,
+        "買い目": bets,
+        "点数": len(bets),
+        "採用理由": "Engine-B: 艇別スコア上位から、最も起こりやすい3連単を構成。",
+    }
+
+
+def build_portfolio_advice(engine_a, engine_b, race_data):
+    """v25.5: A/Bの一致度とレース分類から購入配分を出す。"""
+    a_bets = engine_a.get("買い目", []) or []
+    b_bets = engine_b.get("買い目", []) or []
+    overlap = [x for x in a_bets if x in b_bets]
+    overlap_rate = round(len(overlap) / max(1, min(len(a_bets), len(b_bets))) * 100, 1)
+    style = (engine_a.get("レース分類", {}) or {}).get("レース分類", "")
+    rough = safe_float((engine_a.get("レース分類", {}) or {}).get("荒れ指数")) or 0
+    hard = safe_float((engine_a.get("レース分類", {}) or {}).get("硬さ指数")) or 0
+    inner_score = safe_int((engine_a.get("イン信頼", {}) or {}).get("1号艇信頼度")) or 0
+
+    if overlap_rate >= 45:
+        grade = "★★★★★"
+        action = "A/B一致度高。重なった買い目を厚め。"
+        a_weight, b_weight = 50, 50
+    elif style == "穴狙い" or rough >= 28:
+        grade = "★★★☆☆"
+        action = "A優先。Bは保険程度。"
+        a_weight, b_weight = 70, 30
+    elif hard >= 40 or inner_score >= 70:
+        grade = "★★★★☆"
+        action = "B優先。Aの重複買い目だけ厚め。"
+        a_weight, b_weight = 30, 70
+    else:
+        grade = "★★★☆☆"
+        action = "通常。A/Bを分散。"
+        a_weight, b_weight = 50, 50
+
+    portfolio_bets = []
+    for combo in overlap:
+        portfolio_bets.append({"買い目": combo, "区分": "A/B重複", "推奨": "厚め"})
+    for combo in a_bets:
+        if combo not in overlap:
+            portfolio_bets.append({"買い目": combo, "区分": "A専用", "推奨": "期待値"})
+    for combo in b_bets:
+        if combo not in overlap:
+            portfolio_bets.append({"買い目": combo, "区分": "B専用", "推奨": "的中率"})
+
+    return {
+        "評価": grade,
+        "方針": action,
+        "A比率": a_weight,
+        "B比率": b_weight,
+        "一致買い目": overlap,
+        "一致率": overlap_rate,
+        "ポートフォリオ買い目": portfolio_bets[:16],
+    }
+
+
+def make_machine_bets(race_data):
+    """
+    v25.5: 互換性維持のため返却トップの「買い目」はEngine-Aのまま。
+    新たに Engine-A / Engine-B / ポートフォリオ を同梱する。
+    """
+    engine_a = build_engine_a_prediction(race_data)
+    engine_b = build_engine_b_prediction(race_data)
+    portfolio = build_portfolio_advice(engine_a, engine_b, race_data)
+    return {
+        "安定度": engine_a["安定度"],
+        "イン信頼": engine_a["イン信頼"],
+        "レース分類": engine_a["レース分類"],
+        "買い目": engine_a["買い目"],
+        "点数": len(engine_a["買い目"]),
+        "Engine-A": engine_a,
+        "Engine-B": engine_b,
+        "ポートフォリオ": portfolio,
     }
 
 
@@ -2068,6 +2288,9 @@ def get_csv_fieldnames():
         "1号艇展示タイム", "1号艇展示順位", "1号艇展示差", "展示レンジ", "1号艇展示ST", "1号艇展示ST順位",
         "1号艇進入安定度", "1号艇逃げ率",
         "v22特徴取得数", "v22本文キーワード", "v22特徴監査", "v241取得元監査",
+        "EngineA買い目", "EngineA採用理由", "EngineB買い目", "EngineB採用理由",
+        "EngineB上位艇", "EngineB艇スコア", "ポートフォリオ評価", "ポートフォリオ方針",
+        "ポートフォリオA比率", "ポートフォリオB比率", "ポートフォリオ一致率", "ポートフォリオ一致買い目",
         "予想買い目", "投資額", "結果", "1着艇", "2着艇", "3着艇",
         "払戻", "人気", "的中", "回収", "決まり手", "結果URL", "結果3連単", "着順リスト",
         "結果風速", "結果風向", "結果波高", "結果水温",
@@ -2332,6 +2555,18 @@ def backtest_urls(urls, skip_x=True, include_deep=False, filename_prefix="backte
                     "v22特徴取得数": race_data.get("v22特徴取得数", ""),
                     "v22本文キーワード": json.dumps(race_data.get("v22本文キーワード", {}), ensure_ascii=False),
                     "v22特徴監査": json.dumps(race_data.get("v22特徴監査", {}), ensure_ascii=False),
+                    "EngineA買い目": " ".join((pred.get("Engine-A", {}) or {}).get("買い目", [])),
+                    "EngineA採用理由": (pred.get("Engine-A", {}) or {}).get("採用理由", ""),
+                    "EngineB買い目": " ".join((pred.get("Engine-B", {}) or {}).get("買い目", [])),
+                    "EngineB採用理由": (pred.get("Engine-B", {}) or {}).get("採用理由", ""),
+                    "EngineB上位艇": " ".join((pred.get("Engine-B", {}) or {}).get("上位艇", [])),
+                    "EngineB艇スコア": json.dumps((pred.get("Engine-B", {}) or {}).get("艇スコア", []), ensure_ascii=False),
+                    "ポートフォリオ評価": (pred.get("ポートフォリオ", {}) or {}).get("評価", ""),
+                    "ポートフォリオ方針": (pred.get("ポートフォリオ", {}) or {}).get("方針", ""),
+                    "ポートフォリオA比率": (pred.get("ポートフォリオ", {}) or {}).get("A比率", ""),
+                    "ポートフォリオB比率": (pred.get("ポートフォリオ", {}) or {}).get("B比率", ""),
+                    "ポートフォリオ一致率": (pred.get("ポートフォリオ", {}) or {}).get("一致率", ""),
+                    "ポートフォリオ一致買い目": " ".join((pred.get("ポートフォリオ", {}) or {}).get("一致買い目", [])),
                     "予想買い目": " ".join(bets),
                     "投資額": bet_amount,
                     "結果": trifecta,
@@ -2368,6 +2603,9 @@ def backtest_urls(urls, skip_x=True, include_deep=False, filename_prefix="backte
                         "1号艇信頼度": inner_score,
                         "1号艇信頼度帯": row.get("1号艇信頼度帯", ""),
                         "予想買い目": bets,
+                        "EngineA": pred.get("Engine-A", {}),
+                        "EngineB": pred.get("Engine-B", {}),
+                        "ポートフォリオ": pred.get("ポートフォリオ", {}),
                         "結果": trifecta,
                         "払戻": payout,
                         "人気": result.get("人気", ""),
@@ -2385,9 +2623,13 @@ def backtest_urls(urls, skip_x=True, include_deep=False, filename_prefix="backte
                     print("  ⚠️ prediction_history保存失敗:", type(hist_e).__name__, str(hist_e))
 
                 print("  rank=", rank, "inner=", row["1号艇信頼度"], "result=", trifecta, "hit=", hit, "pay=", pay, "kimarite=", result.get("決まり手", ""), "wind=", result.get("風速", ""), "wave=", result.get("波高", ""))
+                print("  PF=", row.get("ポートフォリオ評価", ""), row.get("ポートフォリオ方針", ""), "A:B=", str(row.get("ポートフォリオA比率", "")) + ":" + str(row.get("ポートフォリオB比率", "")), "一致=", row.get("ポートフォリオ一致買い目", ""))
             except Exception as e:
                 row.update({
                     "解析選手数": "", "安定度ランク": "?", "安定度スコア": "", "1号艇信頼度": "",
+                    "EngineA買い目": "", "EngineA採用理由": "", "EngineB買い目": "", "EngineB採用理由": "",
+                    "EngineB上位艇": "", "EngineB艇スコア": "", "ポートフォリオ評価": "", "ポートフォリオ方針": "",
+                    "ポートフォリオA比率": "", "ポートフォリオB比率": "", "ポートフォリオ一致率": "", "ポートフォリオ一致買い目": "",
                     "予想買い目": "", "投資額": 0, "結果": "", "払戻": 0, "人気": "",
                     "的中": "0", "回収": 0, "決まり手": "", "結果URL": "", "結果3連単": "", "着順リスト": "",
                     "結果風速": "", "結果風向": "", "結果波高": "", "結果水温": "", "結果取得エラー": "",
@@ -2982,7 +3224,7 @@ def run_cli():
 
 
 def main():
-    print("\n===== ボートレース予想・検証ツール v25.4 オーケストレーター版 =====")
+    print("\n===== ボートレース予想・検証ツール v25.5 ポートフォリオ試作版 =====")
     print("保存先:", SAVE_DIR)
     print("1: 締切前レース予想")
     print("2: URL直接指定で予想/取得テスト")
