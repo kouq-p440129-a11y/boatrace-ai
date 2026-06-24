@@ -24,7 +24,7 @@ jobs:
 
       - name: Run Orchestrator
         run: |
-          printf "9\n${{ matrix.group }}\n300\n300\n" | python main.py
+          printf "9\n${{ matrix.group }}\n\n100\n90\ny\nn\n" | python main.py
 
       - name: Show Summary
         run: |
