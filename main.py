@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-ボートレース予想・検証ツール v25.3 条件抽出エンジン
+ボートレース予想・検証ツール v25.4 オーケストレーター版
 - Pyto/iPhone想定
 - 取得が止まる場所を特定するため、GET開始/完了/BS開始/完了を表示
 - 全requestsにtimeoutを設定
@@ -22,6 +22,9 @@ import csv
 import hashlib
 import time
 import unicodedata
+import argparse
+import sys
+import glob
 
 try:
     import pyperclip
@@ -1468,7 +1471,7 @@ def build_prediction_history_summary(history):
             add_metric(groups[gname][key], rec)
 
     summary = {
-        "version": "v25.3",
+        "version": "v25.4",
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "source": "prediction_history.json",
         "保存先": SAVE_DIR,
@@ -2121,7 +2124,7 @@ def build_summary(rows):
     hit_count = sum(safe_int(r.get("的中", 0)) for r in rows)
     roi = round(total_pay / total_bet * 100, 1) if total_bet else 0
     summary = {
-        "version": "v25.3",
+        "version": "v25.4",
         "対象レース数": len(rows),
         "購入対象レース数": sum(1 for r in rows if safe_int(r.get("投資額", 0)) > 0),
         "的中数": hit_count,
@@ -2715,15 +2718,279 @@ def run_url_test():
     print("✅ 保存:", p)
 
 
+
+# ============================================================
+# v25.4 オーケストレーター機能
+# - GitHub Actions 6時間制限対策
+# - 全24場を4グループに分割
+# - グループ単位で実行・保存
+# - 最後にグループ結果を合算
+# ============================================================
+
+ORCHESTRATOR_GROUPS = {
+    "A": ["kiryu", "toda", "edogawa", "heiwajima", "tamagawa", "hamanako"],
+    "B": ["gamagori", "tokoname", "tsu", "mikuni", "biwako", "suminoe"],
+    "C": ["amagasaki", "naruto", "marugame", "kojima", "miyajima", "tokuyama"],
+    "D": ["shimonoseki", "wakamatsu", "ashiya", "fukuoka", "karatsu", "omura"],
+}
+
+ORCHESTRATOR_DIR_NAME = "orchestrator_results"
+
+
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def orchestrator_dir():
+    return ensure_dir(os.path.join(SAVE_DIR, ORCHESTRATOR_DIR_NAME))
+
+
+def parse_bool_flag(value, default=False):
+    if value is None:
+        return default
+    s = str(value).strip().lower()
+    if s in ["1", "true", "t", "yes", "y", "on"]:
+        return True
+    if s in ["0", "false", "f", "no", "n", "off"]:
+        return False
+    return default
+
+
+def resolve_orchestrator_codes(group_or_codes):
+    """
+    group_or_codes:
+      A/B/C/D/all
+      or "karatsu,mikuni"
+    """
+    q = (group_or_codes or "").strip()
+    if not q:
+        return [], "UNKNOWN"
+
+    uq = q.upper()
+    if uq in ORCHESTRATOR_GROUPS:
+        return ORCHESTRATOR_GROUPS[uq], uq
+
+    if q.lower() in ["all", "全部", "ぜんぶ", "24場"]:
+        codes = []
+        for group_codes in ORCHESTRATOR_GROUPS.values():
+            for c in group_codes:
+                if c not in codes:
+                    codes.append(c)
+        return codes, "ALL"
+
+    codes = parse_place_codes_input(q)
+    label = "CUSTOM"
+    return codes, label
+
+
+def write_rows_csv(path, rows):
+    """グループ合算用に行データをCSV保存する。"""
+    fieldnames = get_csv_fieldnames()
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+
+def load_rows_from_many_csv(paths):
+    rows = []
+    for path in paths:
+        rows.extend(read_rows_from_csv(path))
+    return rows
+
+
+def save_orchestrator_state(state):
+    path = os.path.join(orchestrator_dir(), "orchestrator_state.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    print("✅ orchestrator_state保存:", path)
+    return path
+
+
+def run_orchestrator_group(group="A", limit=300, max_days=180, base_date="", skip_x=True, include_deep=False):
+    """
+    v25.4: 1グループだけ実行する。
+    GitHub Actionsでは matrix で A/B/C/D を並列実行する想定。
+    """
+    codes, group_label = resolve_orchestrator_codes(group)
+    if not codes:
+        print("❌ オーケストレーター対象場がありません:", group)
+        return [], {}
+
+    out_dir = orchestrator_dir()
+    started_at = datetime.now().isoformat(timespec="seconds")
+
+    print("\n===== v25.4 オーケストレーター グループ実行 =====")
+    print("group:", group_label)
+    print("places:", ", ".join(PLACE_MAP_REV.get(c, c) for c in codes))
+    print("limit:", limit, "max_days:", max_days, "base_date:", base_date or "today")
+    print("skip_x:", skip_x, "include_deep:", include_deep)
+
+    all_rows = []
+    place_summaries = {}
+
+    for code in codes:
+        print("\n==============================")
+        print("ORCH開始:", group_label, PLACE_MAP_REV.get(code, code))
+        print("==============================")
+
+        urls = get_recent_completed_race_urls(code, base_date, limit=limit, max_days=max_days, debug=True)
+        prefix = f"orch_{group_label}_{code}_recent_{len(urls)}"
+        rows, summary = backtest_urls(
+            urls,
+            skip_x=skip_x,
+            include_deep=include_deep,
+            filename_prefix=prefix
+        )
+        all_rows.extend(rows)
+        place_summaries[code] = summary
+
+        # 場ごとの途中状態も保存
+        state = {
+            "version": "v25.4",
+            "group": group_label,
+            "started_at": started_at,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "completed_places": list(place_summaries.keys()),
+            "remaining_places": [c for c in codes if c not in place_summaries],
+            "limit": limit,
+            "max_days": max_days,
+            "base_date": base_date,
+            "skip_x": skip_x,
+            "include_deep": include_deep,
+        }
+        save_orchestrator_state(state)
+
+    group_rows_path = os.path.join(out_dir, f"backtest_group_{group_label}_rows.csv")
+    write_rows_csv(group_rows_path, all_rows)
+
+    group_summary = build_summary(all_rows)
+    group_summary["version"] = "v25.4"
+    group_summary["orchestrator_group"] = group_label
+    group_summary["places"] = codes
+    group_summary["場別サマリ"] = place_summaries
+    group_summary["rows_csv"] = group_rows_path
+
+    group_summary_path = os.path.join(out_dir, f"backtest_group_{group_label}_summary.json")
+    with open(group_summary_path, "w", encoding="utf-8") as f:
+        json.dump(group_summary, f, ensure_ascii=False, indent=2)
+
+    print("✅ グループ行CSV保存:", group_rows_path)
+    print("✅ グループsummary保存:", group_summary_path)
+    print(json.dumps(group_summary, ensure_ascii=False, indent=2))
+
+    return all_rows, group_summary
+
+
+def combine_orchestrator_results():
+    """
+    v25.4: orchestrator_results/backtest_group_*_rows.csv を合算して summary を作る。
+    """
+    out_dir = orchestrator_dir()
+    row_files = sorted(glob.glob(os.path.join(out_dir, "backtest_group_*_rows.csv")))
+
+    if not row_files:
+        print("❌ 合算対象CSVがありません:", out_dir)
+        return {}
+
+    print("\n===== v25.4 オーケストレーター結果合算 =====")
+    for f in row_files:
+        print("対象:", f)
+
+    rows = load_rows_from_many_csv(row_files)
+    combined = build_summary(rows)
+    combined["version"] = "v25.4"
+    combined["orchestrator_combined_files"] = row_files
+
+    combined_path = os.path.join(out_dir, "backtest_orchestrator_combined_summary.json")
+    with open(combined_path, "w", encoding="utf-8") as f:
+        json.dump(combined, f, ensure_ascii=False, indent=2)
+
+    # ActionsのShow Summaryで見やすいようにルートにも保存
+    root_path = save_path("backtest_orchestrator_combined_summary.json")
+    with open(root_path, "w", encoding="utf-8") as f:
+        json.dump(combined, f, ensure_ascii=False, indent=2)
+
+    print("✅ オーケストレーター合算JSON保存:", combined_path)
+    print("✅ ルートにも保存:", root_path)
+    print(json.dumps(combined, ensure_ascii=False, indent=2))
+    return combined
+
+
+def run_orchestrator_interactive():
+    print("\n===== v25.4 オーケストレーター =====")
+    print("グループ:")
+    for k, codes in ORCHESTRATOR_GROUPS.items():
+        print(f"  {k}: " + " / ".join(PLACE_MAP_REV.get(c, c) for c in codes))
+    print("  all: 全グループ")
+    print("  combine: 保存済みグループ結果を合算")
+
+    group = input("実行グループ（A/B/C/D/all/combine）: ").strip() or "A"
+    if group.lower() == "combine":
+        combine_orchestrator_results()
+        return
+
+    base_date = input("基準日 YYYY-MM-DD（空欄なら今日）: ").strip()
+    limit_s = input("各場の検証件数（空欄なら300）: ").strip()
+    max_days_s = input("最大探索日数（空欄なら180）: ").strip()
+    skip_x_s = input("Xランク見送りを反映しますか？ y/n（おすすめ y）: ").strip().lower()
+    deep_s = input("詳細取得しますか？ y/n（高速なら n）: ").strip().lower()
+
+    limit = int(limit_s) if limit_s.isdigit() else 300
+    max_days = int(max_days_s) if max_days_s.isdigit() else 180
+    skip_x = skip_x_s != "n"
+    include_deep = deep_s == "y"
+
+    if group.lower() == "all":
+        # 1回でallを選べるが、GitHub Actionsでは6時間制限に注意。
+        # 本番は matrix の A/B/C/D 並列推奨。
+        for g in ["A", "B", "C", "D"]:
+            run_orchestrator_group(g, limit=limit, max_days=max_days, base_date=base_date, skip_x=skip_x, include_deep=include_deep)
+        combine_orchestrator_results()
+    else:
+        run_orchestrator_group(group, limit=limit, max_days=max_days, base_date=base_date, skip_x=skip_x, include_deep=include_deep)
+
+
+def run_cli():
+    parser = argparse.ArgumentParser(description="ボートレース予想・検証ツール v25.4")
+    parser.add_argument("--orchestrator", action="store_true", help="v25.4 オーケストレーターを実行")
+    parser.add_argument("--group", default="A", help="A/B/C/D/all/combine または 場コードカンマ区切り")
+    parser.add_argument("--limit", type=int, default=300, help="各場の検証件数")
+    parser.add_argument("--days", type=int, default=180, help="最大探索日数")
+    parser.add_argument("--base-date", default="", help="基準日 YYYY-MM-DD")
+    parser.add_argument("--skip-x", default="y", help="Xランク見送り反映 y/n")
+    parser.add_argument("--deep", default="n", help="詳細取得 y/n")
+    args = parser.parse_args()
+
+    if args.orchestrator:
+        if str(args.group).lower() == "combine":
+            combine_orchestrator_results()
+        else:
+            run_orchestrator_group(
+                args.group,
+                limit=args.limit,
+                max_days=args.days,
+                base_date=args.base_date,
+                skip_x=parse_bool_flag(args.skip_x, True),
+                include_deep=parse_bool_flag(args.deep, False),
+            )
+        return True
+
+    return False
+
+
 def main():
-    print("\n===== ボートレース予想・検証ツール v25.3 条件抽出エンジン =====")
+    print("\n===== ボートレース予想・検証ツール v25.4 オーケストレーター版 =====")
     print("保存先:", SAVE_DIR)
     print("1: 締切前レース予想")
     print("2: URL直接指定で予想/取得テスト")
     print("5: 三国の直近Nレースをバックテスト（20件から推奨）")
     print("6: 任意場の直近Nレースをバックテスト（20件から推奨）")
     print("7: HTMLキーワード監査（v24 URL役割別 /data等を確認）")
-    print("8: prediction_history分析（v25.3 / 条件抽出）")
+    print("8: prediction_history分析（v25.4 / 条件抽出）")
+    print("9: オーケストレーター実行（v25.4 / 分割バックテスト）")
 
     mode = input("\nモードを選んでください: ").strip()
 
@@ -2773,9 +3040,12 @@ def main():
         run_keyword_audit()
     elif mode == "8":
         run_history_analysis()
+    elif mode == "9":
+        run_orchestrator_interactive()
     else:
         print("未対応モードです")
 
 
 if __name__ == "__main__":
-    main()
+    if not run_cli():
+        main()
