@@ -1,4 +1,4 @@
-name: Run Backtest
+name: Run Backtest Orchestrator
 
 on:
   workflow_dispatch:
@@ -6,6 +6,10 @@ on:
 jobs:
   backtest:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [A, B, C, D]
 
     steps:
       - uses: actions/checkout@v4
@@ -18,19 +22,21 @@ jobs:
         run: |
           pip install requests beautifulsoup4 lxml
 
-      - name: Run main
+      - name: Run Orchestrator
         run: |
-          printf "6\nall\n\n100\n600\ny\ny\n" | python main.py
+          printf "9\n${{ matrix.group }}\n300\n300\n" | python main.py
 
       - name: Show Summary
         run: |
-          echo "===== SUMMARY ====="
-          cat backtest_multi_recent_summary.json
+          echo "===== ORCHESTRATOR SUMMARY ====="
+          find orchestrator_results -name "*.json" -maxdepth 2 -type f -print
+          cat orchestrator_results/*.json || true
 
       - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
-          name: backtest-results
+          name: backtest-results-${{ matrix.group }}
           path: |
             *.json
             *.csv
+            orchestrator_results/**
