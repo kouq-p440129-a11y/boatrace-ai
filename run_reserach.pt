@@ -1,0 +1,6 @@
+# BARP Research Runner v25.7 EXP-0001
+# Usage: python run_research.py --input ./backtest_zips --output ./analysis
+from research.analyzer import main
+
+if __name__ == "__main__":
+    main()
