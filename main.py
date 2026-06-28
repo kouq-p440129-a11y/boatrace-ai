@@ -2273,6 +2273,92 @@ def build_miss_reason_log(pred, result, race_data):
         "理由": reasons,
     }
 
+
+
+# ===== BARP v25.7 / EXP-0001: EngineB・Meta予想ログ =====
+def _unique_bets(seq, limit=None):
+    out = []
+    seen = set()
+    for b in seq or []:
+        b = str(b).strip()
+        if not is_valid_trifecta(b):
+            continue
+        if b not in seen:
+            seen.add(b)
+            out.append(b)
+        if limit and len(out) >= limit:
+            break
+    return out
+
+
+def build_engine_b_bets_from_scores(boat_logs, inner_score=None, max_bets=8):
+    """
+    EngineB: 的中率重視モデルの初期仮説。
+    EngineAは変更せず、艇別EngineB点から本命寄りの買い目を別系統で作る。
+    目的は「A/B/Metaの比較ログ」を残し、後続分析に使うこと。
+    """
+    ranked = [x for x in sorted(boat_logs or [], key=lambda z: z.get("EngineB点", 0), reverse=True) if safe_int(x.get("枠"))]
+    frames = [str(safe_int(x.get("枠"))) for x in ranked]
+    if len(frames) < 3:
+        return []
+
+    bets = []
+    top = frames[:4]
+    head = top[0]
+    seconds = [f for f in top if f != head]
+    thirds = [f for f in frames[:5] if f != head]
+
+    # 1号艇信頼度が高い時は1頭本命を優先。ただしB点1位が別ならB点1位も残す。
+    if inner_score is not None and safe_float(inner_score) is not None and safe_float(inner_score) >= 65 and "1" in frames[:3]:
+        head_candidates = ["1"]
+        if head != "1":
+            head_candidates.append(head)
+    else:
+        head_candidates = [head]
+        # Bは的中率重視だが、2番手頭まで少し許容して取りこぼしを確認する。
+        if len(top) > 1:
+            head_candidates.append(top[1])
+
+    for h in head_candidates:
+        sec_pool = [f for f in frames[:4] if f != h]
+        third_pool = [f for f in frames[:5] if f != h]
+        for s2 in sec_pool[:3]:
+            for s3 in third_pool[:4]:
+                if len({h, s2, s3}) == 3:
+                    bets.append(f"{h}-{s2}-{s3}")
+                    if len(_unique_bets(bets)) >= max_bets:
+                        return _unique_bets(bets, max_bets)
+    return _unique_bets(bets, max_bets)
+
+
+def build_meta_bets(engine_a_bets, engine_b_bets, max_bets=8):
+    """
+    Meta初期版: A/Bの一致買い目を最優先し、次にA・Bの上位を混ぜる。
+    ここでは資金配分までは固定せず、比較検証用の買い目を保存する。
+    """
+    a = _unique_bets(engine_a_bets or [])
+    b = _unique_bets(engine_b_bets or [])
+    common = [x for x in a if x in set(b)]
+    mixed = common + a[:4] + b[:4] + a[4:] + b[4:]
+    return _unique_bets(mixed, max_bets)
+
+
+def build_engine_compare_record(engine_a_bets, engine_b_bets, meta_bets, result):
+    trifecta = result.get("3連単", "") if isinstance(result, dict) else ""
+    payout = safe_int(result.get("3連単払戻", "")) if isinstance(result, dict) else 0
+    out = {}
+    for name, bets in [("A", engine_a_bets), ("B", engine_b_bets), ("Meta", meta_bets)]:
+        bets = _unique_bets(bets or [])
+        hit = bool(trifecta and trifecta in bets)
+        out[name] = {
+            "買い目": bets,
+            "点数": len(bets),
+            "投資額": len(bets) * 100,
+            "的中": hit,
+            "回収": payout if hit else 0,
+        }
+    return out
+
 def make_machine_bets(race_data):
     # v21: 的中予想の前に「硬い/中間/穴狙い」を分類して買い目を分岐。
     stability = score_race_stability(race_data)
@@ -2297,6 +2383,14 @@ def make_machine_bets(race_data):
     boat_logs = build_explainable_boat_scores(race_data)
     bet_reason_logs = build_bet_reason_logs(bets, boat_logs, race_data, race_style)
 
+    # BARP v25.7 / EXP-0001:
+    # EngineAは現行買い目そのもの。EngineBとMetaは比較検証用に追加保存する。
+    engine_a_bets = list(bets)
+    engine_b_bets = build_engine_b_bets_from_scores(boat_logs, inner_score=inner_score, max_bets=8)
+    meta_bets = build_meta_bets(engine_a_bets, engine_b_bets, max_bets=8)
+    engine_b_reason_logs = build_bet_reason_logs(engine_b_bets, boat_logs, race_data, race_style)
+    meta_reason_logs = build_bet_reason_logs(meta_bets, boat_logs, race_data, race_style)
+
     return {
         "安定度": stability,
         "イン信頼": inner,
@@ -2305,6 +2399,11 @@ def make_machine_bets(race_data):
         "点数": len(bets),
         "艇別評価ログ": boat_logs,
         "買い目理由ログ": bet_reason_logs,
+        "EngineA買い目": engine_a_bets,
+        "EngineB買い目": engine_b_bets,
+        "Meta買い目": meta_bets,
+        "EngineB買い目理由ログ": engine_b_reason_logs,
+        "Meta買い目理由ログ": meta_reason_logs,
     }
 
 
@@ -2319,7 +2418,11 @@ def get_csv_fieldnames():
         "1号艇展示タイム", "1号艇展示順位", "1号艇展示差", "展示レンジ", "1号艇展示ST", "1号艇展示ST順位",
         "1号艇進入安定度", "1号艇逃げ率",
         "v22特徴取得数", "v22本文キーワード", "v22特徴監査", "v241取得元監査",
-        "予想買い目", "投資額", "艇別評価ログ", "買い目理由ログ", "外れ理由ログ",
+        "予想買い目", "投資額",
+        "EngineA買い目", "EngineA点数", "EngineA投資額", "EngineA的中", "EngineA回収",
+        "EngineB買い目", "EngineB点数", "EngineB投資額", "EngineB的中", "EngineB回収",
+        "Meta買い目", "Meta点数", "Meta投資額", "Meta的中", "Meta回収",
+        "艇別評価ログ", "買い目理由ログ", "EngineB買い目理由ログ", "Meta買い目理由ログ", "外れ理由ログ",
         "EngineA艇順位", "EngineB艇順位", "EngineA平均点", "EngineB平均点",
         "結果", "1着艇", "2着艇", "3着艇",
         "払戻", "人気", "的中", "回収", "決まり手", "結果URL", "結果3連単", "着順リスト",
@@ -2548,6 +2651,12 @@ def backtest_urls(urls, skip_x=True, include_deep=False, filename_prefix="backte
                 payout = safe_int(result.get("3連単払戻", ""))
                 hit = do_bet and trifecta in bets
                 pay = payout if hit else 0
+                engine_compare = build_engine_compare_record(
+                    pred.get("EngineA買い目", bets),
+                    pred.get("EngineB買い目", []),
+                    pred.get("Meta買い目", []),
+                    result
+                )
 
                 first, second, third = split_trifecta(trifecta)
                 psych = race_data.get("心理コンテキスト", {}) or {}
@@ -2587,8 +2696,25 @@ def backtest_urls(urls, skip_x=True, include_deep=False, filename_prefix="backte
                     "v22特徴監査": json.dumps(race_data.get("v22特徴監査", {}), ensure_ascii=False),
                     "予想買い目": " ".join(bets),
                     "投資額": bet_amount,
+                    "EngineA買い目": " ".join(engine_compare["A"]["買い目"]),
+                    "EngineA点数": engine_compare["A"]["点数"],
+                    "EngineA投資額": engine_compare["A"]["投資額"] if do_bet else 0,
+                    "EngineA的中": "1" if (do_bet and engine_compare["A"]["的中"]) else "0",
+                    "EngineA回収": engine_compare["A"]["回収"] if do_bet else 0,
+                    "EngineB買い目": " ".join(engine_compare["B"]["買い目"]),
+                    "EngineB点数": engine_compare["B"]["点数"],
+                    "EngineB投資額": engine_compare["B"]["投資額"] if do_bet else 0,
+                    "EngineB的中": "1" if (do_bet and engine_compare["B"]["的中"]) else "0",
+                    "EngineB回収": engine_compare["B"]["回収"] if do_bet else 0,
+                    "Meta買い目": " ".join(engine_compare["Meta"]["買い目"]),
+                    "Meta点数": engine_compare["Meta"]["点数"],
+                    "Meta投資額": engine_compare["Meta"]["投資額"] if do_bet else 0,
+                    "Meta的中": "1" if (do_bet and engine_compare["Meta"]["的中"]) else "0",
+                    "Meta回収": engine_compare["Meta"]["回収"] if do_bet else 0,
                     "艇別評価ログ": json.dumps(pred.get("艇別評価ログ", []), ensure_ascii=False, separators=(",", ":")),
                     "買い目理由ログ": json.dumps(pred.get("買い目理由ログ", []), ensure_ascii=False, separators=(",", ":")),
+                    "EngineB買い目理由ログ": json.dumps(pred.get("EngineB買い目理由ログ", []), ensure_ascii=False, separators=(",", ":")),
+                    "Meta買い目理由ログ": json.dumps(pred.get("Meta買い目理由ログ", []), ensure_ascii=False, separators=(",", ":")),
                     "外れ理由ログ": json.dumps(build_miss_reason_log(pred, result, race_data), ensure_ascii=False, separators=(",", ":")),
                     "EngineA艇順位": " ".join([str(x.get("枠")) for x in sorted(pred.get("艇別評価ログ", []), key=lambda z: z.get("EngineA点", 0), reverse=True)]),
                     "EngineB艇順位": " ".join([str(x.get("枠")) for x in sorted(pred.get("艇別評価ログ", []), key=lambda z: z.get("EngineB点", 0), reverse=True)]),
@@ -2628,8 +2754,19 @@ def backtest_urls(urls, skip_x=True, include_deep=False, filename_prefix="backte
                         "1号艇信頼度": inner_score,
                         "1号艇信頼度帯": row.get("1号艇信頼度帯", ""),
                         "予想買い目": bets,
+                        "EngineA買い目": pred.get("EngineA買い目", bets),
+                        "EngineB買い目": pred.get("EngineB買い目", []),
+                        "Meta買い目": pred.get("Meta買い目", []),
+                        "EngineA的中": bool(do_bet and engine_compare["A"]["的中"]),
+                        "EngineB的中": bool(do_bet and engine_compare["B"]["的中"]),
+                        "Meta的中": bool(do_bet and engine_compare["Meta"]["的中"]),
+                        "EngineA回収": engine_compare["A"]["回収"] if do_bet else 0,
+                        "EngineB回収": engine_compare["B"]["回収"] if do_bet else 0,
+                        "Meta回収": engine_compare["Meta"]["回収"] if do_bet else 0,
                         "艇別評価ログ": pred.get("艇別評価ログ", []),
                         "買い目理由ログ": pred.get("買い目理由ログ", []),
+                        "EngineB買い目理由ログ": pred.get("EngineB買い目理由ログ", []),
+                        "Meta買い目理由ログ": pred.get("Meta買い目理由ログ", []),
                         "外れ理由ログ": build_miss_reason_log(pred, result, race_data),
                         "EngineA艇順位": row.get("EngineA艇順位", ""),
                         "EngineB艇順位": row.get("EngineB艇順位", ""),
@@ -2653,7 +2790,11 @@ def backtest_urls(urls, skip_x=True, include_deep=False, filename_prefix="backte
             except Exception as e:
                 row.update({
                     "解析選手数": "", "安定度ランク": "?", "安定度スコア": "", "1号艇信頼度": "",
-                    "予想買い目": "", "投資額": 0, "艇別評価ログ": "", "買い目理由ログ": "", "外れ理由ログ": "",
+                    "予想買い目": "", "投資額": 0,
+                    "EngineA買い目": "", "EngineA点数": "", "EngineA投資額": 0, "EngineA的中": "0", "EngineA回収": 0,
+                    "EngineB買い目": "", "EngineB点数": "", "EngineB投資額": 0, "EngineB的中": "0", "EngineB回収": 0,
+                    "Meta買い目": "", "Meta点数": "", "Meta投資額": 0, "Meta的中": "0", "Meta回収": 0,
+                    "艇別評価ログ": "", "買い目理由ログ": "", "EngineB買い目理由ログ": "", "Meta買い目理由ログ": "", "外れ理由ログ": "",
                     "EngineA艇順位": "", "EngineB艇順位": "", "EngineA平均点": "", "EngineB平均点": "",
                     "結果": "", "払戻": 0, "人気": "",
                     "的中": "0", "回収": 0, "決まり手": "", "結果URL": "", "結果3連単": "", "着順リスト": "",
