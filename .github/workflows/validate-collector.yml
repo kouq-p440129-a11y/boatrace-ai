@@ -11,6 +11,15 @@ on:
         description: Max lookback days
         required: true
         default: '120'
+  push:
+    branches:
+      - 'copilot/**'
+    paths:
+      - '.github/workflows/validate-collector.yml'
+      - 'collector.py'
+      - 'data_quality.py'
+      - 'tests/test_collector.py'
+      - '.gitignore'
 
 jobs:
   validate-collector:
@@ -37,8 +46,8 @@ jobs:
           python collector.py \
             --db-path data/collector_validation.sqlite3 \
             --progress-name gha-collection \
-            --target-count "${{ inputs.target_count }}" \
-            --max-days "${{ inputs.max_days }}" \
+            --target-count "${{ github.event_name == 'workflow_dispatch' && inputs.target_count || '1000' }}" \
+            --max-days "${{ github.event_name == 'workflow_dispatch' && inputs.max_days || '120' }}" \
             --process-retry-queue
 
       - name: Resume check
@@ -46,8 +55,8 @@ jobs:
           python collector.py \
             --db-path data/collector_validation.sqlite3 \
             --progress-name gha-collection \
-            --target-count "${{ inputs.target_count }}" \
-            --max-days "${{ inputs.max_days }}"
+            --target-count "${{ github.event_name == 'workflow_dispatch' && inputs.target_count || '1000' }}" \
+            --max-days "${{ github.event_name == 'workflow_dispatch' && inputs.max_days || '120' }}"
 
       - name: Retry queue verification
         run: |
