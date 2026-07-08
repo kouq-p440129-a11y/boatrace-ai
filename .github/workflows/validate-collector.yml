@@ -1,0 +1,106 @@
+name: Validate Race Collector
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_count:
+        description: Target races to collect
+        required: true
+        default: '1000'
+      max_days:
+        description: Max lookback days
+        required: true
+        default: '120'
+  push:
+    branches:
+      - 'copilot/**'
+    paths:
+      - '.github/workflows/validate-collector.yml'
+      - 'collector.py'
+      - 'data_quality.py'
+      - 'tests/test_collector.py'
+      - '.gitignore'
+
+permissions:
+  contents: read
+
+jobs:
+  validate-collector:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install packages
+        run: |
+          pip install requests beautifulsoup4 lxml
+
+      - name: Run unittest
+        run: |
+          python -m unittest discover -s tests -v
+
+      - name: Collect races into SQLite
+        run: |
+          python collector.py \
+            --db-path data/collector_validation.sqlite3 \
+            --progress-name gha-collection \
+            --target-count "${{ github.event_name == 'workflow_dispatch' && inputs.target_count || '1000' }}" \
+            --max-days "${{ github.event_name == 'workflow_dispatch' && inputs.max_days || '120' }}" \
+            --process-retry-queue
+
+      - name: Resume check
+        run: |
+          python collector.py \
+            --db-path data/collector_validation.sqlite3 \
+            --progress-name gha-collection \
+            --target-count "${{ github.event_name == 'workflow_dispatch' && inputs.target_count || '1000' }}" \
+            --max-days "${{ github.event_name == 'workflow_dispatch' && inputs.max_days || '120' }}"
+
+      - name: Retry queue verification
+        run: |
+          python collector.py \
+            --db-path data/collector_validation.sqlite3 \
+            --progress-name gha-collection \
+            --retry-only \
+            --seed-success-retry \
+            --process-retry-queue
+
+      - name: Generate data quality report
+        run: |
+          python data_quality.py \
+            --db-path data/collector_validation.sqlite3 \
+            --progress-name gha-collection \
+            --output reports/data_quality_1000.md
+
+      - name: Show collector progress
+        run: |
+          python - <<'PY'
+          import json, sqlite3
+          conn = sqlite3.connect('data/collector_validation.sqlite3')
+          conn.row_factory = sqlite3.Row
+          row = conn.execute("SELECT * FROM collector_progress WHERE progress_name = 'gha-collection'").fetchone()
+          print(json.dumps(dict(row), ensure_ascii=False, indent=2))
+          conn.close()
+          PY
+
+      - name: Upload collector artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: collector-validation
+          path: |
+            data/collector_validation.sqlite3
+            reports/data_quality_1000.md
+      - name: Enforce quality gate
+        run: |
+          python data_quality.py \
+            --db-path data/collector_validation.sqlite3 \
+            --progress-name gha-collection \
+            --output reports/data_quality_1000.md \
+            --strict
+
