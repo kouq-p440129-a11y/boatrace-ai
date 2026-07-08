@@ -21,6 +21,9 @@ on:
       - 'tests/test_collector.py'
       - '.gitignore'
 
+permissions:
+  contents: read
+
 jobs:
   validate-collector:
     runs-on: ubuntu-latest
